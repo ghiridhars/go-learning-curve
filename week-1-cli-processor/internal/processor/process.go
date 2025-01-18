@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 )
@@ -19,7 +20,8 @@ var ReadCmd = &cobra.Command{
 		wordCount, _ := cmd.Flags().GetBool("word-count")
 		characterCount, _ := cmd.Flags().GetBool("character-count")
 		pattern, _ := cmd.Flags().GetString("search")
-		return readFile(args[0], wordCount, characterCount, pattern)
+		workerCount, _ := cmd.Flags().GetInt("worker-count")
+		return readFile(args[0], wordCount, characterCount, pattern, workerCount)
 	},
 }
 
@@ -27,51 +29,137 @@ func init() {
 	ReadCmd.Flags().BoolP("word-count", "c", false, "Count words in the file")
 	ReadCmd.Flags().BoolP("character-count", "n", false, "Count characters in the file")
 	ReadCmd.Flags().StringP("search", "s", "", "Search for a pattern in the file")
+	ReadCmd.Flags().IntP("worker-count", "w", 4, "Number of concurrent workers") // Add worker flag
 }
 
-func readFile(filename string, wordCount bool, characterCount bool, pattern string) error {
+type FileChunk struct {
+	Lines        []string
+	WordCount    int
+	CharCount    int
+	MatchedLines []string // For pattern matching
+}
 
-	// 1. Open file
+func readFile(filename string, wordCount, characterCount bool, pattern string, workerCount int) error {
+	fmt.Println("Starting file processing...") // Debug
+
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("error opening file: %w", err)
 	}
 	defer file.Close()
 
-	// 2. Read file line by line
-	scanner := bufio.NewScanner(file)
-	lineNum := 1
-	var words int
-	var chars int
+	fmt.Printf("File opened successfully: %s\n", filename) // Debug
 
-	for scanner.Scan() {
-		words += len(strings.Fields(scanner.Text()))
-		chars += len(scanner.Text())
-		if pattern != "" && strings.Contains(scanner.Text(), pattern) {
-			fmt.Printf("Pattern found in line %d: %s\n", lineNum, scanner.Text())
+	chunks := make(chan FileChunk)
+	results := make(chan FileChunk)
+
+	var wg sync.WaitGroup
+	fmt.Printf("Starting %d workers...\n", workerCount) // Debug
+
+	// Workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		workerID := i
+		go func() {
+			defer wg.Done()
+			fmt.Printf("Worker %d started\n", workerID) // Debug
+			for chunk := range chunks {
+				fmt.Printf("Worker %d processing chunk of size %d\n", workerID, len(chunk.Lines))
+				processedChunk := processChunk(chunk, wordCount, characterCount, pattern)
+				fmt.Printf("Worker %d processed chunk: words=%d, chars=%d\n",
+					workerID, processedChunk.WordCount, processedChunk.CharCount)
+				results <- processedChunk
+			}
+		}()
+	}
+
+	// File reader
+	go func() {
+		scanner := bufio.NewScanner(file)
+		currentChunk := FileChunk{}
+		lineCount := 0
+
+		fmt.Println("Starting to read file...") // Debug
+		for scanner.Scan() {
+			currentChunk.Lines = append(currentChunk.Lines, scanner.Text())
+			lineCount++
+
+			if lineCount >= 1000 {
+				fmt.Printf("Sending chunk with %d lines\n", lineCount) // Debug
+				chunks <- currentChunk
+				currentChunk = FileChunk{}
+				lineCount = 0
+			}
 		}
-		// fmt.Printf("Line %d: %s\n", lineNum, scanner.Text())
-		lineNum++
+
+		if len(currentChunk.Lines) > 0 {
+			fmt.Printf("Sending final chunk with %d lines\n", len(currentChunk.Lines)) // Debug
+			chunks <- currentChunk
+		}
+
+		fmt.Println("Closing chunks channel...") // Debug
+		close(chunks)
+	}()
+
+	var totalStats struct {
+		words int
+		chars int
+		lines int
+		sync.Mutex
 	}
 
-	if wordCount {
-		fmt.Printf("Total words: %d\n", words)
-	}
+	var resultsWg sync.WaitGroup
+	resultsWg.Add(1)
 
-	if characterCount {
-		fmt.Printf("Total characters: %d\n", chars)
-	}
+	// Results collector
+	go func() {
+		defer resultsWg.Done()
+		fmt.Println("Starting to collect results...") // Debug
+		for result := range results {
+			totalStats.Lock()
+			totalStats.words += result.WordCount
+			totalStats.chars += result.CharCount
+			totalStats.lines += len(result.Lines)
+			fmt.Printf("Updated totals: words=%d, chars=%d, lines=%d\n", // Debug
+				totalStats.words, totalStats.chars, totalStats.lines)
+			totalStats.Unlock()
+		}
+		fmt.Println("Finished collecting results") // Debug
+	}()
 
-	if pattern != "" {
-		fmt.Printf("Pattern: %s\n", pattern)
-	}
+	fmt.Println("Waiting for workers to finish...") // Debug
+	wg.Wait()
+	fmt.Println("Workers finished, closing results channel...") // Debug
+	close(results)
 
-	fmt.Printf("File: %s has been processed with a total of %d lines.\n", filename, lineNum)
+	fmt.Println("Waiting for results collection...") // Debug
+	resultsWg.Wait()
+	fmt.Println("Results collection complete") // Debug
 
-	// 3. Check for scanner errors
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading file: %w", err)
-	}
+	fmt.Printf("\nFinal Statistics:\n")
+	fmt.Printf("Total Words: %d\n", totalStats.words)
+	fmt.Printf("Total Characters: %d\n", totalStats.chars)
+	fmt.Printf("Total Lines: %d\n", totalStats.lines)
 
 	return nil
+}
+
+func processChunk(chunk FileChunk, wordCount, characterCount bool, pattern string) FileChunk {
+	results := FileChunk{
+		Lines: chunk.Lines,
+	}
+	for _, line := range chunk.Lines {
+		if wordCount {
+			results.WordCount += len(strings.Fields(line))
+		}
+		if characterCount {
+			results.CharCount += len(line)
+		}
+		if pattern != "" {
+			if strings.Contains(line, pattern) {
+				results.MatchedLines = append(chunk.MatchedLines, line)
+			}
+		}
+	}
+	return results
 }

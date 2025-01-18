@@ -35,6 +35,5 @@ func init() {
 	rootCmd.PersistentFlags().StringP("input", "i", "", "Input file or directory path")
 	rootCmd.PersistentFlags().StringP("output", "o", "", "Output file path for results")
 	rootCmd.PersistentFlags().BoolP("recursive", "r", false, "Process files recursively in directories")
-	rootCmd.PersistentFlags().IntP("workers", "w", 1, "Number of concurrent workers")
 	rootCmd.AddCommand(processor.ReadCmd)
 }

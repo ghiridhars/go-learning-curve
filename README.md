@@ -5,9 +5,9 @@
 ### Project 1: CLI File Processor
 **Specifications:**
 - Build a command-line tool that can:
-  - Read text files and count words, lines, and characters
+  ✅ Read text files and count words, lines, and characters
   - Search for patterns using regular expressions
-  - Process multiple files concurrently
+  ✅ Process multiple files concurrently
   - Output results in JSON format
   
 **Reference Implementation:**

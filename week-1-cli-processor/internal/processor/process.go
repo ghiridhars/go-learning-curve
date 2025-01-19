@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -39,68 +41,112 @@ type FileChunk struct {
 	MatchedLines []string // For pattern matching
 }
 
-func readFile(filename string, wordCount, characterCount bool, pattern string, workerCount int) error {
-	fmt.Println("Starting file processing...") // Debug
+// FileProcessor handles the file processing logic
+type FileProcessor struct {
+	filename        string
+	wordCount       bool
+	characterCount  bool
+	pattern         string
+	workerCount     int
+	processedChunks int32
+	totalChunks     int32
+	startTime       time.Time
+}
 
-	file, err := os.Open(filename)
-	if err != nil {
-		return fmt.Errorf("error opening file: %w", err)
+// NewFileProcessor creates a new file processor
+func NewFileProcessor(filename string, wordCount, characterCount bool, pattern string, workerCount int) *FileProcessor {
+	return &FileProcessor{
+		filename:       filename,
+		wordCount:      wordCount,
+		characterCount: characterCount,
+		pattern:        pattern,
+		workerCount:    workerCount,
+		startTime:      time.Now(),
 	}
-	defer file.Close()
+}
 
-	fmt.Printf("File opened successfully: %s\n", filename) // Debug
+func (fp *FileProcessor) initializeFile() (*os.File, error) {
+	file, err := os.Open(fp.filename)
+	if err != nil {
+		return nil, fmt.Errorf("error opening file: %w", err)
+	}
 
-	chunks := make(chan FileChunk)
-	results := make(chan FileChunk)
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	fp.totalChunks = int32(fileInfo.Size()/(100*1000)) + 1
 
+	return file, nil
+}
+
+func (fp *FileProcessor) startProgressBar() {
+	go func() {
+		for {
+			processed := atomic.LoadInt32(&fp.processedChunks)
+			if processed >= fp.totalChunks {
+				break
+			}
+			fp.updateProgress(processed)
+			time.Sleep(time.Millisecond * 100)
+		}
+	}()
+}
+
+func (fp *FileProcessor) updateProgress(processed int32) {
+	percentage := float64(processed) / float64(fp.totalChunks) * 100
+	elapsed := time.Since(fp.startTime)
+	width := 40
+	completed := int(float64(width) * float64(processed) / float64(fp.totalChunks))
+	bar := strings.Repeat("█", completed) + strings.Repeat("░", width-completed)
+
+	fmt.Printf("\r%s %.1f%% (%d/%d chunks) %s",
+		bar, percentage, processed, fp.totalChunks,
+		elapsed.Round(time.Second))
+}
+
+func (fp *FileProcessor) startWorkers(chunks, results chan FileChunk) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	fmt.Printf("Starting %d workers...\n", workerCount) // Debug
-
-	// Workers
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < fp.workerCount; i++ {
 		wg.Add(1)
 		workerID := i
-		go func() {
-			defer wg.Done()
-			fmt.Printf("Worker %d started\n", workerID) // Debug
-			for chunk := range chunks {
-				fmt.Printf("Worker %d processing chunk of size %d\n", workerID, len(chunk.Lines))
-				processedChunk := processChunk(chunk, wordCount, characterCount, pattern)
-				fmt.Printf("Worker %d processed chunk: words=%d, chars=%d\n",
-					workerID, processedChunk.WordCount, processedChunk.CharCount)
-				results <- processedChunk
-			}
-		}()
+		go fp.worker(workerID, &wg, chunks, results)
+	}
+	return &wg
+}
+
+func (fp *FileProcessor) worker(id int, wg *sync.WaitGroup, chunks, results chan FileChunk) {
+	defer wg.Done()
+	for chunk := range chunks {
+		processedChunk := processChunk(chunk, fp.wordCount, fp.characterCount, fp.pattern)
+		results <- processedChunk
+		atomic.AddInt32(&fp.processedChunks, 1)
+	}
+}
+
+func (fp *FileProcessor) readFileInChunks(file *os.File, chunks chan FileChunk) {
+	scanner := bufio.NewScanner(file)
+	currentChunk := FileChunk{}
+	lineCount := 0
+
+	for scanner.Scan() {
+		currentChunk.Lines = append(currentChunk.Lines, scanner.Text())
+		lineCount++
+
+		if lineCount >= 1000 {
+			chunks <- currentChunk
+			currentChunk = FileChunk{}
+			lineCount = 0
+		}
 	}
 
-	// File reader
-	go func() {
-		scanner := bufio.NewScanner(file)
-		currentChunk := FileChunk{}
-		lineCount := 0
+	if len(currentChunk.Lines) > 0 {
+		chunks <- currentChunk
+	}
+	close(chunks)
+}
 
-		fmt.Println("Starting to read file...") // Debug
-		for scanner.Scan() {
-			currentChunk.Lines = append(currentChunk.Lines, scanner.Text())
-			lineCount++
-
-			if lineCount >= 1000 {
-				fmt.Printf("Sending chunk with %d lines\n", lineCount) // Debug
-				chunks <- currentChunk
-				currentChunk = FileChunk{}
-				lineCount = 0
-			}
-		}
-
-		if len(currentChunk.Lines) > 0 {
-			fmt.Printf("Sending final chunk with %d lines\n", len(currentChunk.Lines)) // Debug
-			chunks <- currentChunk
-		}
-
-		fmt.Println("Closing chunks channel...") // Debug
-		close(chunks)
-	}()
-
+func (fp *FileProcessor) collectResults(results chan FileChunk) *sync.WaitGroup {
 	var totalStats struct {
 		words int
 		chars int
@@ -127,21 +173,42 @@ func readFile(filename string, wordCount, characterCount bool, pattern string, w
 		fmt.Println("Finished collecting results") // Debug
 	}()
 
-	fmt.Println("Waiting for workers to finish...") // Debug
-	wg.Wait()
-	fmt.Println("Workers finished, closing results channel...") // Debug
+	return &resultsWg
+}
+
+// Process is the main entry point
+func (fp *FileProcessor) Process() error {
+	file, err := fp.initializeFile()
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	chunks := make(chan FileChunk)
+	results := make(chan FileChunk)
+
+	fp.startProgressBar()
+	workersWg := fp.startWorkers(chunks, results)
+
+	go fp.readFileInChunks(file, chunks)
+	resultsWg := fp.collectResults(results)
+
+	workersWg.Wait()
 	close(results)
 
 	fmt.Println("Waiting for results collection...") // Debug
 	resultsWg.Wait()
 	fmt.Println("Results collection complete") // Debug
 
-	fmt.Printf("\nFinal Statistics:\n")
-	fmt.Printf("Total Words: %d\n", totalStats.words)
-	fmt.Printf("Total Characters: %d\n", totalStats.chars)
-	fmt.Printf("Total Lines: %d\n", totalStats.lines)
-
+	fmt.Printf("\r\033[K") // Clear progress bar
+	fmt.Println("\nProcessing complete!")
 	return nil
+}
+
+// Main function becomes much simpler
+func readFile(filename string, wordCount, characterCount bool, pattern string, workerCount int) error {
+	processor := NewFileProcessor(filename, wordCount, characterCount, pattern, workerCount)
+	return processor.Process()
 }
 
 func processChunk(chunk FileChunk, wordCount, characterCount bool, pattern string) FileChunk {
